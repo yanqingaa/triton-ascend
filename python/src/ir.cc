@@ -861,7 +861,7 @@ void init_triton_ir(py::module &&m) {
       .def("get_or_insert_function",
            [](TritonOpBuilder &self, ModuleOp &module, std::string &funcName,
               Type &funcType, std::string &visibility,
-              bool noinline) -> FuncOp {
+              bool noinline, std::string &global_kernel) -> FuncOp {
              if (Operation *funcOperation = module.lookupSymbol(funcName))
                return llvm::dyn_cast<FuncOp>(funcOperation);
              if (auto funcTy = dyn_cast<FunctionType>(funcType)) {
@@ -870,7 +870,9 @@ void init_triton_ir(py::module &&m) {
                        self.getBuilder().getStringAttr("sym_visibility"),
                        self.getBuilder().getStringAttr(visibility)),
                    NamedAttribute(self.getBuilder().getStringAttr("noinline"),
-                                  self.getBuilder().getBoolAttr(noinline))};
+                                  self.getBuilder().getBoolAttr(noinline)),
+                                  NamedAttribute(self.getBuilder().getStringAttr("global_kernel"),
+                                  self.getBuilder().getStringAttr(global_kernel))};
                return self.create<FuncOp>(funcName, funcTy, attrs);
              }
              throw std::invalid_argument("invalid function type");

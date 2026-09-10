@@ -243,8 +243,20 @@ TritonTypeConverter::TritonTypeConverter() {
 
 void TritonToLinalgPass::addProgramInfo(triton::FuncOp func,
                                         bool globalKernel) {
+  auto attr = func->getAttrOfType<StringAttr>(globalKernelAttr);
+   if (attr && attr.getValue() == "local") {
+      return;
+   }
+
   OpBuilder b(func);
 
+  if (!attr){
+    func->setAttr(globalKernelAttr,
+      b.getStringAttr(globalKernel ? "global" : "local"));
+     if (!globalKernel) {
+       return;
+     }
+  }
   auto origFuncType = func.getFunctionType();
   auto origInputTypes = origFuncType.getInputs();
   SmallVector<Type> newInputTypes(origInputTypes);
@@ -268,11 +280,11 @@ void TritonToLinalgPass::addProgramInfo(triton::FuncOp func,
     func.getBody().front().addArgument(b.getI32Type(), func.getLoc());
   }
 
-  if (globalKernel) {
-    func->setAttr(globalKernelAttr, b.getStringAttr(""));
-  } else {
-    func->setAttr(globalKernelAttr, b.getStringAttr("local"));
-  }
+  // if (globalKernel) {
+  //   func->setAttr(globalKernelAttr, b.getStringAttr(""));
+  // } else {
+  //   func->setAttr(globalKernelAttr, b.getStringAttr("local"));
+  // }
 }
 
 LogicalResult

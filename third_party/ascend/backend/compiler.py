@@ -174,6 +174,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         enable_mask_fallback_conversion = metadata["enable_mask_fallback_conversion"]
         optimize_dynamic_offset = metadata["optimize_dynamic_offset"]
         auto_blockify_size = metadata["auto_blockify_size"]
+        global_kernel = metadata.get("global_kernel", True)
         enable_mixed_cv = metadata["enable_mixed_cv"]
         disable_auto_inject_block_sync = metadata["disable_auto_inject_block_sync"]
         set_workspace_multibuffer = metadata["set_workspace_multibuffer"]
@@ -219,7 +220,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         )
         ascend.passes.ttir.add_triton_to_linalg(
             pm,
-            False,
+            global_kernel,
             named_ops,
             enable_nd2nz_on_vector,
             enable_select_analysis,
@@ -1030,6 +1031,7 @@ class NPUOptions:
     enable_costmodel_backend: bool = False
     # disable simt fma optimization to get high precision
     disable_fma: bool = False
+    global_kernel: bool = True
 
     # superblocking factor
     superblock_factor: int = 1

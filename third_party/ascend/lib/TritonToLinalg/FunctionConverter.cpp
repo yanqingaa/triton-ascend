@@ -21,18 +21,23 @@
  */
 
 #include "ascend/include/TritonToLinalg/FunctionConverter.h"
-
+#include <string>
 namespace FunctionConverter {
 using namespace mlir;
 using namespace triton;
-
+inline const std::string globalKernelAttr = "global_kernel";
 LogicalResult GetProgramIDConverter::matchAndRewrite(
     triton::GetProgramIdOp op, OpAdaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
+  auto func = op->getParentOfType<FunctionOpInterface>();
+  auto globalKernel = func->getAttrOfType<StringAttr>(globalKernelAttr);
+  if (!globalKernel || globalKernel.getValue() == "local") {
+     return failure();
+  }
   auto axis = (uint32_t)op.getAxis();
   assert(axis < GetProgramIDConverter::LAUNCH_GRID_RANK &&
          "Invalid axis for GetProgramIdOp");
-  auto func = op->getParentOfType<FunctionOpInterface>();
+  // auto func = op->getParentOfType<FunctionOpInterface>();
   auto numArgs = func.getNumArguments();
   auto id = func.getArgument(numArgs - GetProgramIDConverter::LAUNCH_GRID_RANK +
                              axis);
