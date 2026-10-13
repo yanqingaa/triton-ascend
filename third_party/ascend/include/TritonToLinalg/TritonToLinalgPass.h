@@ -49,6 +49,7 @@ std::unique_ptr<OperationPass<ModuleOp>> createTritonToLinalgPass(bool, bool, bo
 using namespace mlir;
 using namespace triton;
 const std::string globalKernelAttr = "global_kernel";
+const std::string mkKernelAttrName = "mk_kernel";
 const std::string kernelMixModeName = "mix_mode";
 const std::string kernelParallelModeName = "parallel_mode";
 

@@ -1030,6 +1030,7 @@ class NPUOptions:
     enable_costmodel_backend: bool = False
     # disable simt fma optimization to get high precision
     disable_fma: bool = False
+    mk_kernel: bool = False
 
     # superblocking factor
     superblock_factor: int = 1
@@ -1167,6 +1168,9 @@ class AscendBackend(BaseBackend):
                 if k in opts
             }
             args.setdefault("arch", self.target.arch)
+            # If global_kernel=False is passed (megakernel path), set mk_kernel=True
+            if not opts.get("global_kernel", True):
+                args["mk_kernel"] = True
             options = NPUOptions(**args)
             # Costmodel path should avoid extra BC<->MLIR conversion stages
             # to keep compile-only autotune routing lightweight and stable.

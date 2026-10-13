@@ -478,6 +478,10 @@ void TritonToLinalgPass::convertTTFunc(triton::FuncOp func,
   if (kernelAttr) {
     funcFunc->setAttr(globalKernelAttr, kernelAttr);
   }
+  auto mkKernelAttr = func->getAttr(mkKernelAttrName);
+  if (mkKernelAttr) {
+    funcFunc->setAttr(mkKernelAttrName, mkKernelAttr);
+  }
   std::string kernelMixMode = "aiv";
   if (existDot) {
     // mix also works for pure cube kernel by using the same MAGIC_ELF keyword
