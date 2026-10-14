@@ -1290,11 +1290,10 @@ void TritonToLinalgPass::runOnOperation() {
 
           OpBuilder builder(rcOdd);
           auto loc = rcOdd.getLoc();
-          SmallVector<OpFoldResult> newOffsets(rcOdd.getConstifiedMixedOffset());
-          newOffsets.back() = builder.getIndexAttr(1);
+          OpFoldResult newOffset = builder.getIndexAttr(1);
 
           auto newRc = builder.create<memref::ReinterpretCastOp>(
-              loc, rcOdd.getType(), rcEven.getSource(), newOffsets,
+              loc, rcOdd.getType(), rcEven.getSource(), newOffset,
               rcOdd.getConstifiedMixedSizes(),
               rcOdd.getConstifiedMixedStrides());
 
@@ -1303,7 +1302,7 @@ void TritonToLinalgPass::runOnOperation() {
 
           SmallVector<Operation *> pair = {aIsOdd ? matB : matA,
                                            aIsOdd ? matA : matB};
-          InterleaveStatusOptimization(pair);
+          auto result = InterleaveStatusOptimization(pair);
           break;
         }
       }
