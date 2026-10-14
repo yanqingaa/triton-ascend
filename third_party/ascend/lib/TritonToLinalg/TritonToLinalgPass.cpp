@@ -22,6 +22,7 @@
  */
 
 #include <cstdlib>
+#include <functional>
 
 #include "ascend/include/TritonToLinalg/TritonToLinalgPass.h"
 #include "TritonToLinalg/BlockPtrAnalysis.h"
@@ -54,6 +55,7 @@
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/IR/Types.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
@@ -1175,6 +1177,137 @@ void TritonToLinalgPass::runOnOperation() {
           reinterpretCastOp.getStaticStrides());
     }
     rewriter.eraseOp(op);
+  }
+
+  // Normalize pointer_cast-based interleave stores in mega-kernel functions.
+  //
+  // In the mega-kernel compilation path (mk_kernel=true), the output pointer
+  // is loaded from an io_tensors array and cast via hivm::PointerCastOp. This
+  // produces *different* SSA values for the even and odd stride-2 stores,
+  // even though they share a common base address with offsets differing by 1
+  // element. The existing InterleaveStatusOptimization candidate collection
+  // only matches BlockArgument-sourced stores, so it cannot pair them.
+  //
+  // This normalization runs *only* on mk_kernel functions. It rewrites the
+  // odd store's reinterpret_cast to use the even pointer_cast source with
+  // offset [1], then directly calls InterleaveStatusOptimization to merge
+  // the pair into a single stride-1 store. The existing candidate collection
+  // logic below is left completely unchanged.
+  {
+    std::function<bool(Operation *, int)> chainHasAddConstOne =
+        [&](Operation *op, int depth) -> bool {
+      if (!op || depth > 10)
+        return false;
+      if (auto addOp = dyn_cast<arith::AddIOp>(op)) {
+        for (auto operand : {addOp.getLhs(), addOp.getRhs()}) {
+          if (auto constOp = operand.getDefiningOp<arith::ConstantOp>()) {
+            if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValueAttr()))
+              if (intAttr.getInt() == 1)
+                return true;
+          }
+        }
+      }
+      for (auto operand : op->getOperands()) {
+        auto defOp = operand.getDefiningOp();
+        if (!defOp || isa<arith::ConstantOp>(defOp))
+          continue;
+        if (chainHasAddConstOne(defOp, depth + 1))
+          return true;
+      }
+      return false;
+    };
+
+    for (auto func : moduleOp.getOps<func::FuncOp>()) {
+      if (!func->hasAttr("mk_kernel"))
+        continue;
+
+      SmallVector<bufferization::MaterializeInDestinationOp> pcCandidates;
+      func.walk([&](bufferization::MaterializeInDestinationOp op) {
+        if (auto rcOp = op.getDest().getDefiningOp<memref::ReinterpretCastOp>()) {
+          if (rcOp.getStaticStrides().back() == 2 &&
+              rcOp.getSource().getDefiningOp<hivm::PointerCastOp>()) {
+            pcCandidates.push_back(op);
+          }
+        }
+      });
+
+      for (size_t i = 0; i < pcCandidates.size(); i++) {
+        for (size_t j = i + 1; j < pcCandidates.size(); j++) {
+          auto matA = pcCandidates[i];
+          auto matB = pcCandidates[j];
+          auto rcA = matA.getDest().getDefiningOp<memref::ReinterpretCastOp>();
+          auto rcB = matB.getDest().getDefiningOp<memref::ReinterpretCastOp>();
+
+          if (rcA.getStaticSizes() != rcB.getStaticSizes())
+            continue;
+          if (rcA.getStaticStrides() != rcB.getStaticStrides())
+            continue;
+
+          auto offA = rcA.getConstifiedMixedOffset();
+          auto offB = rcB.getConstifiedMixedOffset();
+          if (!llvm::isa<Attribute>(offA) || !llvm::isa<Attribute>(offB))
+            continue;
+          auto intA = getConstantIntValue(offA);
+          auto intB = getConstantIntValue(offB);
+          if (!intA.has_value() || !intB.has_value())
+            continue;
+          if (intA.value() != 0 || intB.value() != 0)
+            continue;
+
+          auto pcA = rcA.getSource().getDefiningOp<hivm::PointerCastOp>();
+          auto pcB = rcB.getSource().getDefiningOp<hivm::PointerCastOp>();
+          Value addrA = pcA.getAddrs()[0];
+          Value addrB = pcB.getAddrs()[0];
+
+          auto addA = addrA.getDefiningOp<arith::AddIOp>();
+          auto addB = addrB.getDefiningOp<arith::AddIOp>();
+          if (!addA || !addB)
+            continue;
+
+          Value offsetA, offsetB;
+          bool found = false;
+          if (addA.getLhs() == addB.getLhs()) {
+            offsetA = addA.getRhs(); offsetB = addB.getRhs(); found = true;
+          } else if (addA.getLhs() == addB.getRhs()) {
+            offsetA = addA.getRhs(); offsetB = addB.getLhs(); found = true;
+          } else if (addA.getRhs() == addB.getLhs()) {
+            offsetA = addA.getLhs(); offsetB = addB.getRhs(); found = true;
+          } else if (addA.getRhs() == addB.getRhs()) {
+            offsetA = addA.getLhs(); offsetB = addB.getLhs(); found = true;
+          }
+          if (!found)
+            continue;
+
+          bool aIsOdd = chainHasAddConstOne(offsetA.getDefiningOp(), 0);
+          bool bIsOdd = chainHasAddConstOne(offsetB.getDefiningOp(), 0);
+          if (aIsOdd == bIsOdd)
+            continue;
+
+          memref::ReinterpretCastOp rcEven = aIsOdd ? rcB : rcA;
+          memref::ReinterpretCastOp rcOdd = aIsOdd ? rcA : rcB;
+          bufferization::MaterializeInDestinationOp matOdd =
+              aIsOdd ? matA : matB;
+
+          OpBuilder builder(rcOdd);
+          auto loc = rcOdd.getLoc();
+          SmallVector<OpFoldResult> newOffsets(rcOdd.getConstifiedMixedOffset());
+          newOffsets.back() = builder.getIndexAttr(1);
+
+          auto newRc = builder.create<memref::ReinterpretCastOp>(
+              loc, rcOdd.getType(), rcEven.getSource(), newOffsets,
+              rcOdd.getConstifiedMixedSizes(),
+              rcOdd.getConstifiedMixedStrides());
+
+          matOdd.getDestMutable().assign(newRc.getResult());
+          rcOdd.erase();
+
+          SmallVector<Operation *> pair = {aIsOdd ? matB : matA,
+                                           aIsOdd ? matA : matB};
+          InterleaveStatusOptimization(pair);
+          break;
+        }
+      }
+    }
   }
 
   // Try interleave optimization
