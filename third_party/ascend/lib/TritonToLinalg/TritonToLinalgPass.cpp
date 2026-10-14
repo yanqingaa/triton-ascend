@@ -1306,6 +1306,118 @@ void TritonToLinalgPass::runOnOperation() {
           break;
         }
       }
+
+      // Collect masked interleave stores: dest is SubViewOp →
+      // ReinterpretCastOp → PointerCastOp with stride-2.  When PAD_N_H >
+      // BLOCK_H (e.g. n_h=32, BLOCK_H=16) the head mask is non-trivial, so
+      // StoreConverter lowers the masked tl.store through a SubView +
+      // ExtractSlice path instead of a direct ReinterpretCast.  The
+      // non-masked normalization above misses these because the dest is a
+      // SubView, not a ReinterpretCast.
+      SmallVector<bufferization::MaterializeInDestinationOp> pcMaskedCandidates;
+      func.walk([&](bufferization::MaterializeInDestinationOp op) {
+        if (auto svOp = op.getDest().getDefiningOp<memref::SubViewOp>()) {
+          if (!op.getSource().getDefiningOp<tensor::ExtractSliceOp>())
+            return;
+          if (auto rcOp =
+                  svOp.getSource().getDefiningOp<memref::ReinterpretCastOp>()) {
+            if (rcOp.getStaticStrides().back() == 2 &&
+                rcOp.getSource().getDefiningOp<hivm::PointerCastOp>()) {
+              pcMaskedCandidates.push_back(op);
+            }
+          }
+        }
+      });
+
+      for (size_t i = 0; i < pcMaskedCandidates.size(); i++) {
+        for (size_t j = i + 1; j < pcMaskedCandidates.size(); j++) {
+          auto matA = pcMaskedCandidates[i];
+          auto matB = pcMaskedCandidates[j];
+          auto svA = matA.getDest().getDefiningOp<memref::SubViewOp>();
+          auto svB = matB.getDest().getDefiningOp<memref::SubViewOp>();
+          auto rcA = svA.getSource().getDefiningOp<memref::ReinterpretCastOp>();
+          auto rcB = svB.getSource().getDefiningOp<memref::ReinterpretCastOp>();
+
+          if (rcA.getStaticSizes() != rcB.getStaticSizes())
+            continue;
+          if (rcA.getStaticStrides() != rcB.getStaticStrides())
+            continue;
+
+          auto offA = rcA.getConstifiedMixedOffset();
+          auto offB = rcB.getConstifiedMixedOffset();
+          if (!llvm::isa<Attribute>(offA) || !llvm::isa<Attribute>(offB))
+            continue;
+          auto intA = getConstantIntValue(offA);
+          auto intB = getConstantIntValue(offB);
+          if (!intA.has_value() || !intB.has_value())
+            continue;
+          if (intA.value() != 0 || intB.value() != 0)
+            continue;
+
+          auto pcA = rcA.getSource().getDefiningOp<hivm::PointerCastOp>();
+          auto pcB = rcB.getSource().getDefiningOp<hivm::PointerCastOp>();
+          Value addrA = pcA.getAddrs()[0];
+          Value addrB = pcB.getAddrs()[0];
+
+          auto addA = addrA.getDefiningOp<arith::AddIOp>();
+          auto addB = addrB.getDefiningOp<arith::AddIOp>();
+          if (!addA || !addB)
+            continue;
+
+          Value offsetA, offsetB;
+          bool found = false;
+          if (addA.getLhs() == addB.getLhs()) {
+            offsetA = addA.getRhs(); offsetB = addB.getRhs(); found = true;
+          } else if (addA.getLhs() == addB.getRhs()) {
+            offsetA = addA.getRhs(); offsetB = addB.getLhs(); found = true;
+          } else if (addA.getRhs() == addB.getLhs()) {
+            offsetA = addA.getLhs(); offsetB = addB.getRhs(); found = true;
+          } else if (addA.getRhs() == addB.getRhs()) {
+            offsetA = addA.getLhs(); offsetB = addB.getLhs(); found = true;
+          }
+          if (!found)
+            continue;
+
+          bool aIsOdd = chainHasAddConstOne(offsetA.getDefiningOp(), 0);
+          bool bIsOdd = chainHasAddConstOne(offsetB.getDefiningOp(), 0);
+          if (aIsOdd == bIsOdd)
+            continue;
+
+          memref::ReinterpretCastOp rcEven = aIsOdd ? rcB : rcA;
+          memref::ReinterpretCastOp rcOdd = aIsOdd ? rcA : rcB;
+          memref::SubViewOp svOdd = aIsOdd ? svA : svB;
+          bufferization::MaterializeInDestinationOp matOdd =
+              aIsOdd ? matA : matB;
+
+          OpBuilder builder(rcOdd);
+          auto loc = rcOdd.getLoc();
+          OpFoldResult newOffset = builder.getIndexAttr(1);
+
+          auto newRc = builder.create<memref::ReinterpretCastOp>(
+              loc, rcOdd.getType(), rcEven.getSource(), newOffset,
+              rcOdd.getConstifiedMixedSizes(),
+              rcOdd.getConstifiedMixedStrides());
+
+          SmallVector<OpFoldResult> svOffsets(svOdd.getMixedOffsets());
+          SmallVector<OpFoldResult> svSizes(svOdd.getMixedSizes());
+          SmallVector<OpFoldResult> svStrides(svOdd.getMixedStrides());
+
+          auto newSvType = memref::SubViewOp::inferResultType(
+              newRc.getType(), svOffsets, svSizes, svStrides);
+          auto newSv = builder.create<memref::SubViewOp>(
+              loc, llvm::cast<MemRefType>(newSvType), newRc.getResult(),
+              svOffsets, svSizes, svStrides);
+
+          matOdd.getDestMutable().assign(newSv.getResult());
+          svOdd.erase();
+          rcOdd.erase();
+
+          SmallVector<Operation *> pair = {aIsOdd ? matB : matA,
+                                           aIsOdd ? matA : matB};
+          auto maskResult = InterleaveStatusWithMaskOptimization(pair);
+          break;
+        }
+      }
     }
   }
 
