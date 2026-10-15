@@ -22,6 +22,7 @@
  */
 
 #include <cstdlib>
+#include <functional>
 
 #include "ascend/include/TritonToLinalg/TritonToLinalgPass.h"
 #include "TritonToLinalg/BlockPtrAnalysis.h"
@@ -54,6 +55,7 @@
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/IR/Types.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
@@ -477,6 +479,10 @@ void TritonToLinalgPass::convertTTFunc(triton::FuncOp func,
   auto kernelAttr = func->getAttr(globalKernelAttr);
   if (kernelAttr) {
     funcFunc->setAttr(globalKernelAttr, kernelAttr);
+  }
+  auto mkKernelAttr = func->getAttr(mkKernelAttrName);
+  if (mkKernelAttr) {
+    funcFunc->setAttr(mkKernelAttrName, mkKernelAttr);
   }
   std::string kernelMixMode = "aiv";
   if (existDot) {
@@ -1171,6 +1177,238 @@ void TritonToLinalgPass::runOnOperation() {
           reinterpretCastOp.getStaticStrides());
     }
     rewriter.eraseOp(op);
+  }
+
+  // Normalize pointer_cast-based interleave stores in mega-kernel functions.
+  //
+  // In the mega-kernel compilation path (mk_kernel=true), the output pointer
+  // is loaded from an io_tensors array and cast via hivm::PointerCastOp. This
+  // produces *different* SSA values for the even and odd stride-2 stores,
+  // even though they share a common base address with offsets differing by 1
+  // element. The existing InterleaveStatusOptimization candidate collection
+  // only matches BlockArgument-sourced stores, so it cannot pair them.
+  //
+  // This normalization runs *only* on mk_kernel functions. It rewrites the
+  // odd store's reinterpret_cast to use the even pointer_cast source with
+  // offset [1], then directly calls InterleaveStatusOptimization (or the
+  // WithMask variant) to merge the pair into a single stride-1 store.
+  //
+  // Two store patterns are handled:
+  //   (A) Non-masked: dest is ReinterpretCastOp directly.
+  //   (B) Masked:     dest is SubViewOp → ReinterpretCastOp (when
+  //                   PAD_N_H > BLOCK_H, the head mask is non-trivial and
+  //                   StoreConverter lowers via SubView + ExtractSlice).
+  {
+    // Recursively checks whether an operation's defining chain contains an
+    // arith.addi with a constant-1 operand.  Used to distinguish odd offset
+    // chains (which include "+1") from even offset chains.
+    std::function<bool(Operation *, int)> chainHasAddConstOne =
+        [&](Operation *op, int depth) -> bool {
+      if (!op || depth > 10)
+        return false;
+      if (auto addOp = dyn_cast<arith::AddIOp>(op)) {
+        for (auto operand : {addOp.getLhs(), addOp.getRhs()}) {
+          if (auto constOp = operand.getDefiningOp<arith::ConstantOp>()) {
+            if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValueAttr()))
+              if (intAttr.getInt() == 1)
+                return true;
+          }
+        }
+      }
+      for (auto operand : op->getOperands()) {
+        auto defOp = operand.getDefiningOp();
+        if (!defOp || isa<arith::ConstantOp>(defOp))
+          continue;
+        if (chainHasAddConstOne(defOp, depth + 1))
+          return true;
+      }
+      return false;
+    };
+
+    // Holds the result of a successful even/odd pairing.
+    struct InterleavePairInfo {
+      bufferization::MaterializeInDestinationOp matEven;
+      bufferization::MaterializeInDestinationOp matOdd;
+      memref::ReinterpretCastOp rcEven;
+      memref::ReinterpretCastOp rcOdd;
+    };
+
+    // Tries to pair two stride-2 store candidates that share a common
+    // pointer_cast base address.  Performs all checks that are identical
+    // for masked and non-masked stores:
+    //   1. ReinterpretCast sizes match
+    //   2. ReinterpretCast strides match
+    //   3. Both ReinterpretCast offsets are constant 0
+    //   4. Both PointerCast addresses come from arith.addi with a common base
+    //   5. Exactly one offset chain contains "+1" (odd), the other doesn't (even)
+    // Returns the pair info on success, or nullopt on failure.
+    auto tryPairCandidates =
+        [&](bufferization::MaterializeInDestinationOp matA,
+            bufferization::MaterializeInDestinationOp matB,
+            memref::ReinterpretCastOp rcA,
+            memref::ReinterpretCastOp rcB)
+        -> std::optional<InterleavePairInfo> {
+      if (rcA.getStaticSizes() != rcB.getStaticSizes())
+        return std::nullopt;
+      if (rcA.getStaticStrides() != rcB.getStaticStrides())
+        return std::nullopt;
+
+      auto offA = rcA.getConstifiedMixedOffset();
+      auto offB = rcB.getConstifiedMixedOffset();
+      if (!llvm::isa<Attribute>(offA) || !llvm::isa<Attribute>(offB))
+        return std::nullopt;
+      auto intA = getConstantIntValue(offA);
+      auto intB = getConstantIntValue(offB);
+      if (!intA.has_value() || !intB.has_value())
+        return std::nullopt;
+      if (intA.value() != 0 || intB.value() != 0)
+        return std::nullopt;
+
+      auto pcA = rcA.getSource().getDefiningOp<hivm::PointerCastOp>();
+      auto pcB = rcB.getSource().getDefiningOp<hivm::PointerCastOp>();
+      Value addrA = pcA.getAddrs()[0];
+      Value addrB = pcB.getAddrs()[0];
+
+      auto addA = addrA.getDefiningOp<arith::AddIOp>();
+      auto addB = addrB.getDefiningOp<arith::AddIOp>();
+      if (!addA || !addB)
+        return std::nullopt;
+
+      Value offsetA, offsetB;
+      bool found = false;
+      if (addA.getLhs() == addB.getLhs()) {
+        offsetA = addA.getRhs(); offsetB = addB.getRhs(); found = true;
+      } else if (addA.getLhs() == addB.getRhs()) {
+        offsetA = addA.getRhs(); offsetB = addB.getLhs(); found = true;
+      } else if (addA.getRhs() == addB.getLhs()) {
+        offsetA = addA.getLhs(); offsetB = addB.getRhs(); found = true;
+      } else if (addA.getRhs() == addB.getRhs()) {
+        offsetA = addA.getLhs(); offsetB = addB.getLhs(); found = true;
+      }
+      if (!found)
+        return std::nullopt;
+
+      bool aIsOdd = chainHasAddConstOne(offsetA.getDefiningOp(), 0);
+      bool bIsOdd = chainHasAddConstOne(offsetB.getDefiningOp(), 0);
+      if (aIsOdd == bIsOdd)
+        return std::nullopt;
+
+      return InterleavePairInfo{
+          aIsOdd ? matB : matA,  // matEven
+          aIsOdd ? matA : matB,  // matOdd
+          aIsOdd ? rcB : rcA,    // rcEven
+          aIsOdd ? rcA : rcB     // rcOdd
+      };
+    };
+
+    // Creates a new ReinterpretCast for the odd store that reuses the even
+    // store's pointer_cast source with offset [1] instead of a separate
+    // pointer_cast.  This is the shared normalization step that makes the
+    // two stores share the same source, enabling InterleaveStatusOptimization
+    // to merge them.
+    auto createNormalizedRc =
+        [](memref::ReinterpretCastOp rcEven,
+           memref::ReinterpretCastOp rcOdd) -> memref::ReinterpretCastOp {
+      OpBuilder builder(rcOdd);
+      return builder.create<memref::ReinterpretCastOp>(
+          rcOdd.getLoc(), rcOdd.getType(), rcEven.getSource(),
+          builder.getIndexAttr(1),
+          rcOdd.getConstifiedMixedSizes(),
+          rcOdd.getConstifiedMixedStrides());
+    };
+
+    for (auto func : moduleOp.getOps<func::FuncOp>()) {
+      if (!func->hasAttr("mk_kernel"))
+        continue;
+
+      // ── (A) Non-masked stores: dest is ReinterpretCastOp directly ──
+      SmallVector<bufferization::MaterializeInDestinationOp> pcCandidates;
+      func.walk([&](bufferization::MaterializeInDestinationOp op) {
+        if (auto rcOp = op.getDest().getDefiningOp<memref::ReinterpretCastOp>()) {
+          if (rcOp.getStaticStrides().back() == 2 &&
+              rcOp.getSource().getDefiningOp<hivm::PointerCastOp>()) {
+            pcCandidates.push_back(op);
+          }
+        }
+      });
+
+      for (size_t i = 0; i < pcCandidates.size(); i++) {
+        for (size_t j = i + 1; j < pcCandidates.size(); j++) {
+          auto matA = pcCandidates[i];
+          auto matB = pcCandidates[j];
+          auto rcA = matA.getDest().getDefiningOp<memref::ReinterpretCastOp>();
+          auto rcB = matB.getDest().getDefiningOp<memref::ReinterpretCastOp>();
+
+          auto pair = tryPairCandidates(matA, matB, rcA, rcB);
+          if (!pair)
+            continue;
+
+          auto newRc = createNormalizedRc(pair->rcEven, pair->rcOdd);
+          pair->matOdd.getDestMutable().assign(newRc.getResult());
+          pair->rcOdd.erase();
+
+          SmallVector<Operation *> optPair = {pair->matEven, pair->matOdd};
+          (void)InterleaveStatusOptimization(optPair);
+          break;
+        }
+      }
+
+      // ── (B) Masked stores: dest is SubViewOp → ReinterpretCastOp ──
+      // When PAD_N_H > BLOCK_H, the head mask is non-trivial, so
+      // StoreConverter lowers the masked tl.store through a SubView +
+      // ExtractSlice path instead of a direct ReinterpretCast.
+      SmallVector<bufferization::MaterializeInDestinationOp> pcMaskedCandidates;
+      func.walk([&](bufferization::MaterializeInDestinationOp op) {
+        if (auto svOp = op.getDest().getDefiningOp<memref::SubViewOp>()) {
+          if (!op.getSource().getDefiningOp<tensor::ExtractSliceOp>())
+            return;
+          if (auto rcOp =
+                  svOp.getSource().getDefiningOp<memref::ReinterpretCastOp>()) {
+            if (rcOp.getStaticStrides().back() == 2 &&
+                rcOp.getSource().getDefiningOp<hivm::PointerCastOp>()) {
+              pcMaskedCandidates.push_back(op);
+            }
+          }
+        }
+      });
+
+      for (size_t i = 0; i < pcMaskedCandidates.size(); i++) {
+        for (size_t j = i + 1; j < pcMaskedCandidates.size(); j++) {
+          auto matA = pcMaskedCandidates[i];
+          auto matB = pcMaskedCandidates[j];
+          auto svA = matA.getDest().getDefiningOp<memref::SubViewOp>();
+          auto svB = matB.getDest().getDefiningOp<memref::SubViewOp>();
+          auto rcA = svA.getSource().getDefiningOp<memref::ReinterpretCastOp>();
+          auto rcB = svB.getSource().getDefiningOp<memref::ReinterpretCastOp>();
+
+          auto pair = tryPairCandidates(matA, matB, rcA, rcB);
+          if (!pair)
+            continue;
+
+          auto svOdd = pair->matOdd.getDest().getDefiningOp<memref::SubViewOp>();
+          auto newRc = createNormalizedRc(pair->rcEven, pair->rcOdd);
+
+          SmallVector<OpFoldResult> svOffsets(svOdd.getMixedOffsets());
+          SmallVector<OpFoldResult> svSizes(svOdd.getMixedSizes());
+          SmallVector<OpFoldResult> svStrides(svOdd.getMixedStrides());
+
+          auto newSvType = memref::SubViewOp::inferResultType(
+              newRc.getType(), svOffsets, svSizes, svStrides);
+          OpBuilder builder(pair->rcOdd);
+          auto newSv = builder.create<memref::SubViewOp>(
+              pair->rcOdd.getLoc(), llvm::cast<MemRefType>(newSvType),
+              newRc.getResult(), svOffsets, svSizes, svStrides);
+
+          pair->matOdd.getDestMutable().assign(newSv.getResult());
+          svOdd.erase();
+          pair->rcOdd.erase();
+
+          SmallVector<Operation *> optPair = {pair->matEven, pair->matOdd};
+          (void)InterleaveStatusWithMaskOptimization(optPair);
+          break;
+        }
+      }
+    }
   }
 
   // Try interleave optimization

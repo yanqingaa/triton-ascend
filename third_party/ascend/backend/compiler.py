@@ -1030,6 +1030,7 @@ class NPUOptions:
     enable_costmodel_backend: bool = False
     # disable simt fma optimization to get high precision
     disable_fma: bool = False
+    mk_kernel: bool = False
 
     # superblocking factor
     superblock_factor: int = 1

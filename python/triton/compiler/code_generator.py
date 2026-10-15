@@ -445,8 +445,10 @@ class CodeGenerator(ast.NodeVisitor):
 
         # initialize function
         visibility = "public" if self.is_kernel else "private"
+        mk_kernel = self.builder.options.mk_kernel
+        fn_ty = self.prototype.to_ir(self.builder)
         self.fn = self.builder.get_or_insert_function(self.module, self.function_name,
-                                                      self.prototype.to_ir(self.builder), visibility, self.noinline)
+                                                      fn_ty, visibility, self.noinline, mk_kernel)
         self.module.push_back(self.fn)
         entry = self.fn.add_entry_block()
         arg_values = []
